@@ -38,6 +38,11 @@ export default defineTask({
       for (const upload of uploads) {
         await db.transaction().execute(async (tx) => {
           await tx.deleteFrom('uploads').where('id', '=', upload.id).execute()
+          await tx
+            .deleteFrom('storage_locations')
+            .where('folderName', '=', upload.folderName)
+            .where('availableAt', 'is', null)
+            .execute()
           await storage.adapter.deleteFolder(upload.folderName)
         })
       }

@@ -39,6 +39,10 @@ function escapeLikePattern(value: string) {
     .replaceAll('_', String.raw`\_`)
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 export class ObjectNotFoundError extends Error {
   constructor(objectName: string) {
     super(`Object not found in storage: ${objectName}`)
@@ -57,11 +61,20 @@ export class Storage {
   }
 
   static async getAdapterFromEnv() {
-    return await match(env)
+    const adapter = await match(env)
       .with({ STORAGE_DRIVER: 's3' }, S3Adapter.fromEnv)
       .with({ STORAGE_DRIVER: 'filesystem' }, FileSystemAdapter.fromEnv)
       .with({ STORAGE_DRIVER: 'gcs' }, GcsAdapter.fromEnv)
       .exhaustive()
+
+    if (!env.STORAGE_FILESYSTEM_CACHE_PATH || env.STORAGE_DRIVER === 'filesystem') return adapter
+
+    return FilesystemCachingAdapter.fromEnv({
+      backend: adapter,
+      cachePath: env.STORAGE_FILESYSTEM_CACHE_PATH,
+      maxObjectSize: env.STORAGE_FILESYSTEM_CACHE_MAX_OBJECT_SIZE_BYTES,
+      maxSize: env.STORAGE_FILESYSTEM_CACHE_MAX_SIZE_BYTES,
+    })
   }
 
   static async fromEnv() {
@@ -72,7 +85,10 @@ export class Storage {
   }
 
   waitForOngoingMerges() {
-    return Promise.all(this.mergeStreamPromises)
+    return Promise.all([
+      ...this.mergeStreamPromises,
+      ...(this.adapter.waitForIdle ? [this.adapter.waitForIdle()] : []),
+    ])
   }
 
   async uploadPart(uploadId: number, partIndex: number, stream: ReadableStream) {
@@ -148,19 +164,40 @@ export class Storage {
     }
 
     await this.db.transaction().execute(async (tx) => {
-      const locationId = randomUUID()
-      await tx
-        .insertInto('storage_locations')
-        .values({
-          id: locationId,
-          folderName: upload.folderName,
-          partCount,
-          mergedAt: null,
-          mergeStartedAt: null,
-          partsDeletedAt: null,
-          lastDownloadedAt: null,
-        })
-        .execute()
+      const existingLocation = await tx
+        .selectFrom('storage_locations')
+        .where('folderName', '=', upload.folderName)
+        .select('id')
+        .executeTakeFirst()
+      const locationId = existingLocation?.id ?? randomUUID()
+
+      if (existingLocation) {
+        await tx
+          .updateTable('storage_locations')
+          .set({
+            partCount,
+            availableAt: Date.now(),
+            mergedAt: null,
+            mergeStartedAt: null,
+            partsDeletedAt: null,
+          })
+          .where('id', '=', locationId)
+          .execute()
+      } else {
+        await tx
+          .insertInto('storage_locations')
+          .values({
+            id: locationId,
+            folderName: upload.folderName,
+            partCount,
+            availableAt: Date.now(),
+            mergedAt: null,
+            mergeStartedAt: null,
+            partsDeletedAt: null,
+            lastDownloadedAt: null,
+          })
+          .execute()
+      }
 
       const existingCacheEntry = await tx
         .selectFrom('cache_entries')
@@ -172,7 +209,15 @@ export class Storage {
         .select(['cache_entries.id', 'cache_entries.locationId', 'storage_locations.folderName'])
         .executeTakeFirst()
 
-      if (existingCacheEntry) {
+      if (existingCacheEntry?.locationId === locationId) {
+        await tx
+          .updateTable('cache_entries')
+          .set({
+            updatedAt: Date.now(),
+          })
+          .where('id', '=', existingCacheEntry.id)
+          .execute()
+      } else if (existingCacheEntry) {
         await tx
           .updateTable('cache_entries')
           .set({
@@ -215,40 +260,45 @@ export class Storage {
       .executeTakeFirst()
     if (!storageLocation) return
 
+    const availableLocation = storageLocation.availableAt
+      ? storageLocation
+      : await this.waitForStorageLocationAvailability(storageLocation.id)
+    if (!availableLocation) return
+
     void this.db
       .updateTable('storage_locations')
       .set({
         lastDownloadedAt: Date.now(),
       })
-      .where('id', '=', storageLocation.id)
+      .where('id', '=', availableLocation.id)
       .execute()
 
     try {
-      if (storageLocation.mergedAt || storageLocation.mergeStartedAt)
-        return await this.downloadFromCacheEntryLocation(storageLocation)
+      if (availableLocation.mergedAt || availableLocation.mergeStartedAt)
+        return await this.downloadFromCacheEntryLocation(availableLocation)
 
-      await this.ensurePartsExist(storageLocation)
+      await this.ensurePartsExist(availableLocation)
 
       await this.db
         .updateTable('storage_locations')
         .set({
           mergeStartedAt: Date.now(),
         })
-        .where('id', '=', storageLocation.id)
+        .where('id', '=', availableLocation.id)
         .execute()
 
       const responseStream = new PassThrough()
       const mergerStream = new PassThrough()
 
       const mergePromise = this.adapter
-        .uploadStream(`${storageLocation.folderName}/merged`, mergerStream)
+        .uploadStream(`${availableLocation.folderName}/merged`, mergerStream)
         .then(async () => {
           await this.db
             .updateTable('storage_locations')
             .set({
               mergedAt: Date.now(),
             })
-            .where('id', '=', storageLocation.id)
+            .where('id', '=', availableLocation.id)
             .execute()
           await this.db.transaction().execute(async (tx) => {
             await tx
@@ -256,9 +306,9 @@ export class Storage {
               .set({
                 partsDeletedAt: Date.now(),
               })
-              .where('id', '=', storageLocation.id)
+              .where('id', '=', availableLocation.id)
               .execute()
-            await this.adapter.deleteFolder(`${storageLocation.folderName}/parts`)
+            await this.adapter.deleteFolder(`${availableLocation.folderName}/parts`)
           })
         })
         .catch(async () => {
@@ -268,14 +318,14 @@ export class Storage {
               mergedAt: null,
               mergeStartedAt: null,
             })
-            .where('id', '=', storageLocation.id)
+            .where('id', '=', availableLocation.id)
             .execute()
           mergerStream.destroy()
         })
       this.mergeStreamPromises.add(mergePromise)
       mergePromise.finally(() => this.mergeStreamPromises.delete(mergePromise))
 
-      this.pumpPartsToStreams(storageLocation, responseStream, mergerStream).catch((err) => {
+      this.pumpPartsToStreams(availableLocation, responseStream, mergerStream).catch((err) => {
         responseStream.destroy(err)
         mergerStream.destroy(err)
         if (err instanceof ObjectNotFoundError)
@@ -290,6 +340,23 @@ export class Storage {
       }
       throw err
     }
+  }
+
+  private async waitForStorageLocationAvailability(locationId: string) {
+    const deadline = Date.now() + env.CACHE_PENDING_WAIT_TIMEOUT_MS
+
+    while (Date.now() < deadline) {
+      const location = await this.db
+        .selectFrom('storage_locations')
+        .where('id', '=', locationId)
+        .selectAll()
+        .executeTakeFirst()
+      if (!location) return
+      if (location.availableAt) return location
+      await sleep(250)
+    }
+
+    logger.warn(`Timed out waiting for pending cache storage location ${locationId}`)
   }
 
   private async ensurePartsExist(location: StorageLocation) {
@@ -362,21 +429,61 @@ export class Storage {
     if (existingUpload) return
 
     const uploadId = generateNumberId()
-    await this.db
-      .insertInto('uploads')
-      .values({
-        id: uploadId,
-        folderName: uploadId.toString(),
-        createdAt: Date.now(),
-        key,
-        version,
-        scope,
-        repoId,
-        lastPartUploadedAt: null,
-        finishedPartUploadCount: 0,
-        startedPartUploadCount: 0,
-      })
-      .execute()
+    const folderName = uploadId.toString()
+    await this.db.transaction().execute(async (tx) => {
+      await tx
+        .insertInto('uploads')
+        .values({
+          id: uploadId,
+          folderName,
+          createdAt: Date.now(),
+          key,
+          version,
+          scope,
+          repoId,
+          lastPartUploadedAt: null,
+          finishedPartUploadCount: 0,
+          startedPartUploadCount: 0,
+        })
+        .execute()
+
+      const existingCacheEntry = await tx
+        .selectFrom('cache_entries')
+        .where('key', '=', key)
+        .where('version', '=', version)
+        .where('scope', '=', scope)
+        .where('repoId', '=', repoId)
+        .select('id')
+        .executeTakeFirst()
+      if (existingCacheEntry) return
+
+      const locationId = randomUUID()
+      await tx
+        .insertInto('storage_locations')
+        .values({
+          id: locationId,
+          folderName,
+          partCount: 0,
+          availableAt: null,
+          mergedAt: null,
+          mergeStartedAt: null,
+          partsDeletedAt: null,
+          lastDownloadedAt: null,
+        })
+        .execute()
+      await tx
+        .insertInto('cache_entries')
+        .values({
+          key,
+          version,
+          id: randomUUID(),
+          updatedAt: Date.now(),
+          locationId,
+          scope,
+          repoId,
+        })
+        .execute()
+    })
 
     return { id: uploadId }
   }
@@ -479,13 +586,14 @@ export class Storage {
     const location = await this.db
       .selectFrom('storage_locations')
       .where('id', '=', cacheEntry.match.locationId)
-      .select(['folderName', 'mergedAt'])
+      .select(['availableAt', 'folderName', 'mergedAt'])
       .executeTakeFirst()
     if (!location) throw new Error('Storage location not found')
 
-    const downloadUrl = location.mergedAt
-      ? await this.adapter.createDownloadUrl(`${location.folderName}/merged`)
-      : defaultUrl
+    const downloadUrl =
+      location.availableAt && location.mergedAt
+        ? await this.adapter.createDownloadUrl(`${location.folderName}/merged`)
+        : defaultUrl
 
     return {
       downloadUrl,
@@ -503,6 +611,7 @@ interface StorageAdapter {
   countFilesInFolder(folderName: string): Promise<number>
   createDownloadUrl?(objectName: string): Promise<string>
   clear(): Promise<void>
+  waitForIdle?(): Promise<void>
 }
 
 class S3Adapter implements StorageAdapter {
@@ -709,6 +818,344 @@ class FileSystemAdapter implements StorageAdapter {
       if (err.code === 'ENOENT') return 0
       throw err
     }
+  }
+}
+
+class FilesystemObjectCache {
+  private rootFolder
+  private maxObjectSize
+  private maxSize
+
+  constructor({
+    maxObjectSize,
+    maxSize,
+    rootFolder,
+  }: {
+    maxObjectSize: number
+    maxSize: number
+    rootFolder: string
+  }) {
+    this.rootFolder = path.resolve(rootFolder)
+    this.maxObjectSize = maxObjectSize
+    this.maxSize = maxSize
+  }
+
+  static async create(args: ConstructorParameters<typeof FilesystemObjectCache>[0]) {
+    await fs.mkdir(args.rootFolder, { recursive: true })
+    return new FilesystemObjectCache(args)
+  }
+
+  private safePath(name: string) {
+    const resolved = path.resolve(this.rootFolder, name)
+    if (!resolved.startsWith(this.rootFolder + path.sep) && resolved !== this.rootFolder)
+      throw new Error(`Invalid object name`)
+    return resolved
+  }
+
+  private markerPath(objectName: string) {
+    return `${this.safePath(objectName)}.writeback`
+  }
+
+  private isCacheMetadataFile(filePath: string) {
+    return filePath.includes(`${path.sep}.tmp-`) || filePath.endsWith('.writeback')
+  }
+
+  private async touch(filePath: string) {
+    const now = new Date()
+    await fs.utimes(filePath, now, now).catch(() => {})
+  }
+
+  async createDownloadStream(objectName: string) {
+    const filePath = this.safePath(objectName)
+    try {
+      await fs.access(filePath)
+      await this.touch(filePath)
+      return createReadStream(filePath)
+    } catch {
+      throw new ObjectNotFoundError(objectName)
+    }
+  }
+
+  async countFilesInFolder(folderName: string) {
+    try {
+      const dir = await fs.readdir(this.safePath(folderName), {
+        withFileTypes: true,
+      })
+      return dir.filter((item) => {
+        const itemPath = path.join(this.safePath(folderName), item.name)
+        return item.isFile() && !this.isCacheMetadataFile(itemPath)
+      }).length
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return 0
+      throw err
+    }
+  }
+
+  async deleteFolder(folderName: string) {
+    await fs.rm(this.safePath(folderName), {
+      recursive: true,
+      force: true,
+    })
+  }
+
+  async clear() {
+    await fs.rm(this.rootFolder, {
+      recursive: true,
+      force: true,
+    })
+    await fs.mkdir(this.rootFolder, {
+      recursive: true,
+    })
+  }
+
+  async putForWriteback(objectName: string, stream: Readable) {
+    const markerPath = this.markerPath(objectName)
+    await fs.mkdir(path.dirname(markerPath), { recursive: true })
+    await fs.writeFile(markerPath, '')
+
+    try {
+      return await this.putObject(objectName, stream)
+    } catch (err) {
+      await fs.rm(markerPath, { force: true }).catch(() => {})
+      throw err
+    }
+  }
+
+  async finishWriteback(objectName: string, size: number) {
+    await fs.rm(this.markerPath(objectName), { force: true }).catch(() => {})
+
+    if (size > this.maxObjectSize)
+      await fs.rm(this.safePath(objectName), { force: true }).catch(() => {})
+
+    await this.evictIfNeeded()
+  }
+
+  private async putObject(objectName: string, stream: Readable) {
+    const filePath = this.safePath(objectName)
+    const tmpPath = path.join(
+      path.dirname(filePath),
+      `.tmp-${path.basename(filePath)}-${randomUUID()}`,
+    )
+    await fs.mkdir(path.dirname(filePath), { recursive: true })
+
+    let size = 0
+    const counter = new PassThrough()
+    counter.on('data', (chunk: Buffer) => {
+      size += chunk.length
+    })
+
+    try {
+      await pipeline(stream, counter, createWriteStream(tmpPath))
+      await fs.rename(tmpPath, filePath)
+      await this.touch(filePath)
+      return { filePath, size }
+    } catch (err) {
+      await fs.rm(tmpPath, { force: true }).catch(() => {})
+      throw err
+    }
+  }
+
+  async cacheAndStream(objectName: string, source: Readable) {
+    const filePath = this.safePath(objectName)
+    const tmpPath = path.join(
+      path.dirname(filePath),
+      `.tmp-${path.basename(filePath)}-${randomUUID()}`,
+    )
+    await fs.mkdir(path.dirname(filePath), { recursive: true })
+
+    const responseStream = new PassThrough()
+    let cacheWriter: ReturnType<typeof createWriteStream> | undefined = createWriteStream(tmpPath)
+
+    const done = (async () => {
+      let size = 0
+      try {
+        for await (const chunk of source) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          size += buffer.length
+
+          if (cacheWriter) {
+            if (size <= this.maxObjectSize) {
+              if (!cacheWriter.write(buffer)) await once(cacheWriter, 'drain')
+            } else {
+              cacheWriter.destroy()
+              cacheWriter = undefined
+              await fs.rm(tmpPath, { force: true }).catch(() => {})
+            }
+          }
+
+          if (!responseStream.write(buffer)) await once(responseStream, 'drain')
+        }
+
+        responseStream.end()
+
+        if (cacheWriter) {
+          cacheWriter.end()
+          await once(cacheWriter, 'finish')
+          await fs.rename(tmpPath, filePath)
+          await this.touch(filePath)
+          await this.evictIfNeeded()
+        }
+      } catch (err) {
+        responseStream.destroy(err as Error)
+        cacheWriter?.destroy()
+        await fs.rm(tmpPath, { force: true }).catch(() => {})
+        throw err
+      }
+    })()
+
+    return { done, stream: responseStream }
+  }
+
+  private async listObjects() {
+    const objects: { filePath: string; lastAccessedAt: number; size: number }[] = []
+
+    const walk = async (folder: string) => {
+      let entries
+      try {
+        entries = await fs.readdir(folder, { withFileTypes: true })
+      } catch (err: any) {
+        if (err.code === 'ENOENT') return
+        throw err
+      }
+
+      for (const entry of entries) {
+        const entryPath = path.join(folder, entry.name)
+        if (entry.isDirectory()) {
+          await walk(entryPath)
+          continue
+        }
+        if (!entry.isFile() || this.isCacheMetadataFile(entryPath)) continue
+
+        const markerPath = `${entryPath}.writeback`
+        const [stat, isWritebackPending] = await Promise.all([
+          fs.stat(entryPath),
+          fs
+            .access(markerPath)
+            .then(() => true)
+            .catch(() => false),
+        ])
+        objects.push({
+          filePath: entryPath,
+          lastAccessedAt: stat.mtimeMs,
+          size: stat.size,
+          ...(isWritebackPending ? { lastAccessedAt: Number.POSITIVE_INFINITY } : {}),
+        })
+      }
+    }
+
+    await walk(this.rootFolder)
+    return objects
+  }
+
+  private async evictIfNeeded() {
+    const objects = await this.listObjects()
+    let totalSize = objects.reduce((sum, object) => sum + object.size, 0)
+    if (totalSize <= this.maxSize) return
+
+    for (const object of objects.sort((a, b) => a.lastAccessedAt - b.lastAccessedAt)) {
+      if (object.lastAccessedAt === Number.POSITIVE_INFINITY) continue
+      await fs.rm(object.filePath, { force: true }).catch(() => {})
+      totalSize -= object.size
+      if (totalSize <= this.maxSize) return
+    }
+  }
+}
+
+class FilesystemCachingAdapter implements StorageAdapter {
+  private backend
+  private cache
+  private downloadFills = new Map<string, Promise<void>>()
+  private writebackPromises = new Set<Promise<void>>()
+
+  constructor({ backend, cache }: { backend: StorageAdapter; cache: FilesystemObjectCache }) {
+    this.backend = backend
+    this.cache = cache
+  }
+
+  static async fromEnv({
+    backend,
+    cachePath,
+    maxObjectSize,
+    maxSize,
+  }: {
+    backend: StorageAdapter
+    cachePath: string
+    maxObjectSize: number
+    maxSize: number
+  }) {
+    logger.info(`Using filesystem cache at ${cachePath}`)
+    return new FilesystemCachingAdapter({
+      backend,
+      cache: await FilesystemObjectCache.create({
+        maxObjectSize,
+        maxSize,
+        rootFolder: cachePath,
+      }),
+    })
+  }
+
+  async createDownloadStream(objectName: string) {
+    try {
+      return await this.cache.createDownloadStream(objectName)
+    } catch (err) {
+      if (!(err instanceof ObjectNotFoundError)) throw err
+    }
+
+    const existingFill = this.downloadFills.get(objectName)
+    if (existingFill) {
+      await existingFill
+      try {
+        return await this.cache.createDownloadStream(objectName)
+      } catch (err) {
+        if (!(err instanceof ObjectNotFoundError)) throw err
+      }
+    }
+
+    const source = await this.backend.createDownloadStream(objectName)
+    const { done, stream } = await this.cache.cacheAndStream(objectName, source)
+    const fill = done.finally(() => this.downloadFills.delete(objectName))
+    this.downloadFills.set(objectName, fill)
+    fill.catch((err) => logger.warn(`Failed to populate filesystem cache for ${objectName}`, err))
+
+    return stream
+  }
+
+  async uploadStream(objectName: string, stream: Readable) {
+    const { filePath, size } = await this.cache.putForWriteback(objectName, stream)
+    const writeback = this.backend
+      .uploadStream(objectName, createReadStream(filePath))
+      .then(() => this.cache.finishWriteback(objectName, size))
+      .catch((err) => {
+        logger.error(`Failed to write back ${objectName} to backing storage`, err)
+      })
+      .finally(() => {
+        this.writebackPromises.delete(writeback)
+      })
+
+    this.writebackPromises.add(writeback)
+  }
+
+  async deleteFolder(folderName: string) {
+    await Promise.all([this.cache.deleteFolder(folderName), this.backend.deleteFolder(folderName)])
+  }
+
+  async countFilesInFolder(folderName: string) {
+    const [localCount, backendCount] = await Promise.all([
+      this.cache.countFilesInFolder(folderName),
+      this.backend.countFilesInFolder(folderName),
+    ])
+    return Math.max(localCount, backendCount)
+  }
+
+  async clear() {
+    await Promise.all([this.cache.clear(), this.backend.clear()])
+  }
+
+  async waitForIdle() {
+    await Promise.all([
+      ...this.writebackPromises,
+      ...(this.backend.waitForIdle ? [this.backend.waitForIdle()] : []),
+    ])
   }
 }
 

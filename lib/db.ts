@@ -31,6 +31,7 @@ export const storageLocationSchema = z.object({
   id: z.string(),
   folderName: z.string(),
   partCount: z.number(),
+  availableAt: z.number().nullable(),
   mergeStartedAt: z.number().nullable(),
   mergedAt: z.number().nullable(),
   partsDeletedAt: z.number().nullable(),
@@ -52,8 +53,28 @@ export const uploadSchema = z.object({
 })
 type Upload = z.infer<typeof uploadSchema>
 
+export const dockerRegistryObjectSchema = z.object({
+  id: z.string(),
+  objectKey: z.string(),
+  kind: z.enum(['blob', 'manifest']),
+  repository: z.string(),
+  reference: z.string(),
+  digest: z.string().nullable(),
+  objectName: z.string(),
+  status: z.enum(['filling', 'ready', 'error']),
+  contentType: z.string().nullable(),
+  contentLength: z.number().nullable(),
+  etag: z.string().nullable(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+  filledAt: z.number().nullable(),
+  lastAccessedAt: z.number().nullable(),
+})
+export type DockerRegistryObject = z.infer<typeof dockerRegistryObjectSchema>
+
 export interface Database {
   cache_entries: CacheEntry
+  docker_registry_objects: DockerRegistryObject
   storage_locations: StorageLocation
   uploads: Upload
 }

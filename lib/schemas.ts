@@ -60,12 +60,21 @@ export const envBaseSchema = type({
   'DEFAULT_ACTIONS_RESULTS_URL':
     "string.url = 'https://results-receiver.actions.githubusercontent.com'",
   'CACHE_CLEANUP_OLDER_THAN_DAYS': 'number = 90',
+  'CACHE_PENDING_WAIT_TIMEOUT_MS': 'number = 300000',
   'DISABLE_CLEANUP_JOBS?': 'boolean',
   'DEBUG?': 'unknown',
   'ENABLE_DIRECT_DOWNLOADS': 'boolean = false',
   'BENCHMARK': 'boolean = false',
   'SKIP_TOKEN_VALIDATION': 'boolean = false',
   'MANAGEMENT_API_KEY?': 'string',
+  'STORAGE_FILESYSTEM_CACHE_PATH?': 'string',
+  'STORAGE_FILESYSTEM_CACHE_MAX_SIZE_BYTES': 'number = 10737418240',
+  'STORAGE_FILESYSTEM_CACHE_MAX_OBJECT_SIZE_BYTES': 'number = 1073741824',
+  'DOCKERHUB_MIRROR_ENABLED': 'boolean = true',
+  'DOCKERHUB_REGISTRY_URL': "string.url = 'https://registry-1.docker.io'",
+  'DOCKERHUB_AUTH_URL': "string.url = 'https://auth.docker.io/token'",
+  'DOCKERHUB_MANIFEST_TTL_SECONDS': 'number = 300',
+  'DOCKERHUB_PENDING_WAIT_TIMEOUT_MS': 'number = 300000',
 })
 
 export const envSchema = envBaseSchema.and(envStorageDriverSchema).and(envDbDriverSchema)

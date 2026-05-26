@@ -1,6 +1,7 @@
 import type { Hookable } from 'hookable'
 import type { Migration } from 'kysely'
 import type { Env } from './schemas'
+import { sql } from 'kysely'
 import { Storage } from './storage'
 
 export function migrations(
@@ -156,6 +157,74 @@ export function migrations(
         await db.schema.alterTable('cache_entries').dropColumn('repoId').execute()
         await db.schema.dropIndex('idx_uploads_repoId').execute()
         await db.schema.alterTable('uploads').dropColumn('repoId').execute()
+      },
+    },
+    $4_storage_location_availability: {
+      async up(db) {
+        await db.schema.alterTable('storage_locations').addColumn('availableAt', 'bigint').execute()
+        await db
+          .updateTable('storage_locations')
+          .set({
+            availableAt: Date.now(),
+          })
+          .execute()
+      },
+      async down(db) {
+        await db.schema.alterTable('storage_locations').dropColumn('availableAt').execute()
+      },
+    },
+    $5_docker_registry_objects: {
+      async up(db) {
+        const idType = driver === 'mysql' ? 'varchar(64)' : 'text'
+        const shortText = driver === 'mysql' ? 'varchar(255)' : 'text'
+        const mediumText = driver === 'mysql' ? 'varchar(512)' : 'text'
+
+        await db.schema
+          .createTable('docker_registry_objects')
+          .addColumn('id', idType, (col) => col.primaryKey())
+          .addColumn('objectKey', 'text', (col) => col.notNull())
+          .addColumn('kind', shortText, (col) => col.notNull())
+          .addColumn('repository', mediumText, (col) => col.notNull())
+          .addColumn('reference', mediumText, (col) => col.notNull())
+          .addColumn('digest', mediumText)
+          .addColumn('objectName', 'text', (col) => col.notNull())
+          .addColumn('status', shortText, (col) => col.notNull())
+          .addColumn('contentType', 'text')
+          .addColumn('contentLength', 'bigint')
+          .addColumn('etag', 'text')
+          .addColumn('createdAt', 'bigint', (col) => col.notNull())
+          .addColumn('updatedAt', 'bigint', (col) => col.notNull())
+          .addColumn('filledAt', 'bigint')
+          .addColumn('lastAccessedAt', 'bigint')
+          .execute()
+
+        await db.schema
+          .createIndex('idx_docker_registry_objects_status')
+          .on('docker_registry_objects')
+          .columns(['status'])
+          .execute()
+        await db.schema
+          .createIndex('idx_docker_registry_objects_lastAccessedAt')
+          .on('docker_registry_objects')
+          .columns(['lastAccessedAt'])
+          .execute()
+
+        if (driver === 'postgres') {
+          await sql`create unique index idx_docker_registry_objects_key on docker_registry_objects ("objectKey")`.execute(
+            db,
+          )
+        } else if (driver === 'sqlite') {
+          await sql`create unique index idx_docker_registry_objects_key on docker_registry_objects ("objectKey")`.execute(
+            db,
+          )
+        }
+      },
+      async down(db) {
+        if (driver !== 'mysql')
+          await db.schema.dropIndex('idx_docker_registry_objects_key').execute()
+        await db.schema.dropIndex('idx_docker_registry_objects_lastAccessedAt').execute()
+        await db.schema.dropIndex('idx_docker_registry_objects_status').execute()
+        await db.schema.dropTable('docker_registry_objects').execute()
       },
     },
   } satisfies Record<string, Migration>
