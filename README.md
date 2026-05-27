@@ -38,6 +38,13 @@ volumes:
 
 The Docker Registry v2 mirror is available at `/v2/*` and is enabled by default. Configure Docker with this server as a registry mirror for `docker.io`; blobs and manifests are stored through the configured storage backend, and concurrent pulls of the same uncached object wait on the same fill.
 
+To use Docker Hub authenticated pulls or increase Docker Hub rate limits for the mirror, configure upstream credentials. `DOCKERHUB_PASSWORD` can be a Docker Hub password or access token:
+
+```yaml
+DOCKERHUB_USERNAME: your-dockerhub-user
+DOCKERHUB_PASSWORD: your-dockerhub-access-token
+```
+
 For an S3/Postgres deployment with a local filesystem cache, keep `STORAGE_DRIVER=s3` and `DB_DRIVER=postgres`, then add:
 
 ```yaml

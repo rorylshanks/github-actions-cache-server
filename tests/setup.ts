@@ -21,6 +21,12 @@ import { GenericContainer } from 'testcontainers'
 import { match } from 'ts-pattern'
 import { envSchema } from '~/lib/schemas'
 import {
+  DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,
+  DOCKER_REGISTRY_AUTH_COUNT_KEY,
+  DOCKER_REGISTRY_AUTH_HEADER,
+  DOCKER_REGISTRY_AUTH_PASSWORD,
+  DOCKER_REGISTRY_AUTH_REPOSITORY,
+  DOCKER_REGISTRY_AUTH_USERNAME,
   DOCKER_REGISTRY_CONFIG_BODY,
   DOCKER_REGISTRY_CONFIG_DIGEST,
   DOCKER_REGISTRY_CONFIG_MEDIA_TYPE,
@@ -272,6 +278,20 @@ async function startDockerRegistryFixture() {
     const key = `${req.method ?? 'GET'} ${url.pathname}`
 
     if (url.pathname === '/token') {
+      const authenticated = req.headers.authorization === DOCKER_REGISTRY_AUTH_HEADER
+      incrementDockerRegistryFixtureCount(
+        authenticated ? DOCKER_REGISTRY_AUTH_COUNT_KEY : 'GET /token unauthenticated',
+      )
+
+      if (!authenticated) {
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'www-authenticate': 'Basic realm="fixture Docker Hub auth"',
+        })
+        res.end(JSON.stringify({ errors: [{ code: 'UNAUTHORIZED', message: 'auth required' }] }))
+        return
+      }
+
       res.writeHead(200, {
         'content-type': 'application/json',
       })
@@ -291,6 +311,11 @@ async function startDockerRegistryFixture() {
 
     if (
       url.pathname === dockerRegistryManifestPath('latest') ||
+      url.pathname ===
+        dockerRegistryManifestPath(
+          DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,
+          DOCKER_REGISTRY_AUTH_REPOSITORY,
+        ) ||
       url.pathname === dockerRegistryManifestPath(DOCKER_REGISTRY_MANIFEST_DIGEST)
     ) {
       sendDockerRegistryObject(res, {
@@ -347,6 +372,8 @@ async function startDockerRegistryFixture() {
   const address = dockerRegistryServer.address() as AddressInfo
   process.env.DOCKERHUB_REGISTRY_URL = `http://127.0.0.1:${address.port}`
   process.env.DOCKERHUB_AUTH_URL = `http://127.0.0.1:${address.port}/token`
+  process.env.DOCKERHUB_USERNAME = DOCKER_REGISTRY_AUTH_USERNAME
+  process.env.DOCKERHUB_PASSWORD = DOCKER_REGISTRY_AUTH_PASSWORD
   process.env.DOCKERHUB_MANIFEST_TTL_SECONDS = '3600'
 }
 

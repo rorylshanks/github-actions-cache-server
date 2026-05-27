@@ -73,6 +73,8 @@ export const envBaseSchema = type({
   'DOCKERHUB_MIRROR_ENABLED': 'boolean = true',
   'DOCKERHUB_REGISTRY_URL': "string.url = 'https://registry-1.docker.io'",
   'DOCKERHUB_AUTH_URL': "string.url = 'https://auth.docker.io/token'",
+  'DOCKERHUB_USERNAME?': 'string',
+  'DOCKERHUB_PASSWORD?': 'string',
   'DOCKERHUB_MANIFEST_TTL_SECONDS': 'number = 300',
   'DOCKERHUB_PENDING_WAIT_TIMEOUT_MS': 'number = 300000',
 })

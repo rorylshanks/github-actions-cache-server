@@ -1,6 +1,9 @@
 import fs from 'node:fs/promises'
 import { beforeEach, describe, expect, test } from 'vitest'
 import {
+  DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,
+  DOCKER_REGISTRY_AUTH_COUNT_KEY,
+  DOCKER_REGISTRY_AUTH_REPOSITORY,
   DOCKER_REGISTRY_LAYER_BODY,
   DOCKER_REGISTRY_LAYER_DIGEST,
   DOCKER_REGISTRY_MANIFEST_BODY,
@@ -36,6 +39,23 @@ describe('docker registry mirror', () => {
 
     expect(response.status).toBe(200)
     expect(response.headers.get('docker-distribution-api-version')).toBe('registry/2.0')
+  })
+
+  test('uses configured Docker Hub credentials for upstream token requests', async () => {
+    const manifestPath = dockerRegistryManifestPath(
+      DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,
+      DOCKER_REGISTRY_AUTH_REPOSITORY,
+    )
+    const response = await fetch(`${apiBaseUrl}${manifestPath}`, {
+      headers: {
+        accept: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+      },
+    })
+
+    expect(response.status).toBe(200)
+    const counts = await readDockerRegistryFixtureCounts()
+    expect(counts[DOCKER_REGISTRY_AUTH_COUNT_KEY]).toBe(1)
+    expect(counts['GET /token unauthenticated']).toBeUndefined()
   })
 
   test('stores manifests and blobs, then serves cached objects while upstream is offline', async () => {

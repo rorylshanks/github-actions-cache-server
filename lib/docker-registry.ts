@@ -515,7 +515,13 @@ export class DockerRegistryMirror {
     url.searchParams.set('service', 'registry.docker.io')
     url.searchParams.set('scope', scope)
 
-    const response = await fetch(url)
+    const headers = new Headers()
+    const credentials = this.dockerHubCredentials()
+    if (credentials) headers.set('authorization', credentials)
+
+    const response = await fetch(url, {
+      headers,
+    })
     if (!response.ok)
       throw createError({
         statusCode: response.status,
@@ -535,6 +541,19 @@ export class DockerRegistryMirror {
       token,
     })
     return token
+  }
+
+  private dockerHubCredentials() {
+    if (!env.DOCKERHUB_USERNAME && !env.DOCKERHUB_PASSWORD) return
+    if (!env.DOCKERHUB_USERNAME || !env.DOCKERHUB_PASSWORD)
+      throw createError({
+        statusCode: 500,
+        statusMessage: 'DOCKERHUB_USERNAME and DOCKERHUB_PASSWORD must be set together',
+      })
+
+    return `Basic ${Buffer.from(`${env.DOCKERHUB_USERNAME}:${env.DOCKERHUB_PASSWORD}`).toString(
+      'base64',
+    )}`
   }
 }
 

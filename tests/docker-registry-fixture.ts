@@ -13,6 +13,14 @@ function jsonBuffer(value: unknown) {
 }
 
 export const DOCKER_REGISTRY_REPOSITORY = 'library/cache-server-test'
+export const DOCKER_REGISTRY_AUTH_REPOSITORY = 'library/cache-server-auth-test'
+export const DOCKER_REGISTRY_AUTH_CHECK_REFERENCE = 'auth-check'
+export const DOCKER_REGISTRY_AUTH_USERNAME = 'fixture-dockerhub-user'
+export const DOCKER_REGISTRY_AUTH_PASSWORD = 'fixture-dockerhub-token'
+export const DOCKER_REGISTRY_AUTH_HEADER = `Basic ${Buffer.from(
+  `${DOCKER_REGISTRY_AUTH_USERNAME}:${DOCKER_REGISTRY_AUTH_PASSWORD}`,
+).toString('base64')}`
+export const DOCKER_REGISTRY_AUTH_COUNT_KEY = 'GET /token authenticated'
 export const DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE = 'application/vnd.oci.image.manifest.v1+json'
 export const DOCKER_REGISTRY_CONFIG_MEDIA_TYPE = 'application/vnd.oci.image.config.v1+json'
 export const DOCKER_REGISTRY_LAYER_MEDIA_TYPE = 'application/vnd.oci.image.layer.v1.tar'
@@ -61,12 +69,18 @@ export const DOCKER_REGISTRY_OFFLINE_PATH = path.join(
   'docker-registry-upstream-offline',
 )
 
-export function dockerRegistryManifestPath(reference: string) {
-  return `/v2/${DOCKER_REGISTRY_REPOSITORY}/manifests/${reference}`
+export function dockerRegistryManifestPath(
+  reference: string,
+  repository = DOCKER_REGISTRY_REPOSITORY,
+) {
+  return `/v2/${repository}/manifests/${reference}`
 }
 
-export function dockerRegistryBlobPath(objectDigest: string) {
-  return `/v2/${DOCKER_REGISTRY_REPOSITORY}/blobs/${objectDigest}`
+export function dockerRegistryBlobPath(
+  objectDigest: string,
+  repository = DOCKER_REGISTRY_REPOSITORY,
+) {
+  return `/v2/${repository}/blobs/${objectDigest}`
 }
 
 export async function resetDockerRegistryFixtureState() {
