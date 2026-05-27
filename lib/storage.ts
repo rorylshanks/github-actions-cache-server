@@ -604,7 +604,7 @@ export class Storage {
 
 export const getStorage = createSingletonPromise(async () => Storage.fromEnv())
 
-interface StorageAdapter {
+export interface StorageAdapter {
   createDownloadStream(objectName: string): Promise<Readable>
   uploadStream(objectName: string, stream: Readable): Promise<void>
   deleteFolder(folderName: string): Promise<void>
@@ -1061,7 +1061,7 @@ class FilesystemObjectCache {
   }
 }
 
-class FilesystemCachingAdapter implements StorageAdapter {
+export class FilesystemCachingAdapter implements StorageAdapter {
   private backend
   private cache
   private downloadFills = new Map<string, Promise<void>>()
@@ -1153,6 +1153,7 @@ class FilesystemCachingAdapter implements StorageAdapter {
 
   async waitForIdle() {
     await Promise.all([
+      ...this.downloadFills.values(),
       ...this.writebackPromises,
       ...(this.backend.waitForIdle ? [this.backend.waitForIdle()] : []),
     ])

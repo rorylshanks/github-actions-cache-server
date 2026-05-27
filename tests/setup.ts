@@ -2,10 +2,14 @@
 import type { ResultPromise } from 'execa'
 
 import type { Nitro } from 'nitropack'
+import type { Server, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import type { StartedTestContainer } from 'testcontainers'
 import type { Env, envBaseSchema, envDbDriverSchema, envStorageDriverSchema } from '~/lib/schemas'
 
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
+import { createServer } from 'node:http'
 import path from 'node:path'
 
 import { MySqlContainer } from '@testcontainers/mysql'
@@ -16,6 +20,25 @@ import { build, createNitro, prepare } from 'nitropack'
 import { GenericContainer } from 'testcontainers'
 import { match } from 'ts-pattern'
 import { envSchema } from '~/lib/schemas'
+import {
+  DOCKER_REGISTRY_CONFIG_BODY,
+  DOCKER_REGISTRY_CONFIG_DIGEST,
+  DOCKER_REGISTRY_CONFIG_MEDIA_TYPE,
+  DOCKER_REGISTRY_COUNTS_PATH,
+  DOCKER_REGISTRY_LAYER_BODY,
+  DOCKER_REGISTRY_LAYER_DIGEST,
+  DOCKER_REGISTRY_LAYER_MEDIA_TYPE,
+  DOCKER_REGISTRY_MANIFEST_BODY,
+  DOCKER_REGISTRY_MANIFEST_DIGEST,
+  DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+  DOCKER_REGISTRY_OFFLINE_PATH,
+  DOCKER_REGISTRY_REPOSITORY,
+  DOCKER_REGISTRY_SLOW_LAYER_BODY,
+  DOCKER_REGISTRY_SLOW_LAYER_DIGEST,
+  dockerRegistryBlobPath,
+  dockerRegistryManifestPath,
+  resetDockerRegistryFixtureState,
+} from './docker-registry-fixture'
 
 export const TEST_TEMP_DIR = 'tests/temp'
 
@@ -104,6 +127,7 @@ let server: ResultPromise<{
   node: true
   stdio: 'inherit'
 }>
+let dockerRegistryServer: Server | undefined
 const testContainers: (StartedTestContainer | undefined)[] = []
 export async function setup() {
   Object.assign(
@@ -118,6 +142,7 @@ export async function setup() {
     recursive: true,
   })
   await fs.mkdir(TEST_TEMP_DIR, { recursive: true })
+  await startDockerRegistryFixture()
 
   // eslint-disable-next-line no-console
   console.log('Starting test containers for', env.VITEST_DB_DRIVER, env.VITEST_STORAGE_DRIVER)
@@ -226,8 +251,134 @@ export async function setup() {
 export async function teardown() {
   await server?.kill()
   await nitro?.close()
+  await new Promise<void>((resolve, reject) => {
+    if (!dockerRegistryServer) {
+      resolve()
+      return
+    }
+    dockerRegistryServer.close((err) => (err ? reject(err) : resolve()))
+  })
   await Promise.all(
     testContainers.map((container) => container?.stop({ remove: true, removeVolumes: true })),
   )
   await fs.rm('tests/temp', { recursive: true })
+}
+
+async function startDockerRegistryFixture() {
+  await resetDockerRegistryFixtureState()
+
+  dockerRegistryServer = createServer(async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost')
+    const key = `${req.method ?? 'GET'} ${url.pathname}`
+
+    if (url.pathname === '/token') {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+      })
+      res.end(JSON.stringify({ expires_in: 3600, token: 'fixture-token' }))
+      return
+    }
+
+    incrementDockerRegistryFixtureCount(key)
+
+    if (fsSync.existsSync(DOCKER_REGISTRY_OFFLINE_PATH)) {
+      res.writeHead(503, {
+        'content-type': 'text/plain',
+      })
+      res.end('fixture registry is offline')
+      return
+    }
+
+    if (
+      url.pathname === dockerRegistryManifestPath('latest') ||
+      url.pathname === dockerRegistryManifestPath(DOCKER_REGISTRY_MANIFEST_DIGEST)
+    ) {
+      sendDockerRegistryObject(res, {
+        body: DOCKER_REGISTRY_MANIFEST_BODY,
+        contentType: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+        digest: DOCKER_REGISTRY_MANIFEST_DIGEST,
+      })
+      return
+    }
+
+    if (url.pathname === dockerRegistryBlobPath(DOCKER_REGISTRY_CONFIG_DIGEST)) {
+      sendDockerRegistryObject(res, {
+        body: DOCKER_REGISTRY_CONFIG_BODY,
+        contentType: DOCKER_REGISTRY_CONFIG_MEDIA_TYPE,
+        digest: DOCKER_REGISTRY_CONFIG_DIGEST,
+      })
+      return
+    }
+
+    if (url.pathname === dockerRegistryBlobPath(DOCKER_REGISTRY_LAYER_DIGEST)) {
+      sendDockerRegistryObject(res, {
+        body: DOCKER_REGISTRY_LAYER_BODY,
+        contentType: DOCKER_REGISTRY_LAYER_MEDIA_TYPE,
+        digest: DOCKER_REGISTRY_LAYER_DIGEST,
+      })
+      return
+    }
+
+    if (url.pathname === dockerRegistryBlobPath(DOCKER_REGISTRY_SLOW_LAYER_DIGEST)) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      sendDockerRegistryObject(res, {
+        body: DOCKER_REGISTRY_SLOW_LAYER_BODY,
+        contentType: DOCKER_REGISTRY_LAYER_MEDIA_TYPE,
+        digest: DOCKER_REGISTRY_SLOW_LAYER_DIGEST,
+      })
+      return
+    }
+
+    if (url.pathname === `/v2/${DOCKER_REGISTRY_REPOSITORY}/tags/list`) {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+      })
+      res.end(JSON.stringify({ name: DOCKER_REGISTRY_REPOSITORY, tags: ['latest'] }))
+      return
+    }
+
+    res.writeHead(404, {
+      'content-type': 'text/plain',
+    })
+    res.end('not found')
+  })
+
+  await new Promise<void>((resolve) => dockerRegistryServer?.listen(0, '127.0.0.1', resolve))
+  const address = dockerRegistryServer.address() as AddressInfo
+  process.env.DOCKERHUB_REGISTRY_URL = `http://127.0.0.1:${address.port}`
+  process.env.DOCKERHUB_AUTH_URL = `http://127.0.0.1:${address.port}/token`
+  process.env.DOCKERHUB_MANIFEST_TTL_SECONDS = '3600'
+}
+
+function incrementDockerRegistryFixtureCount(key: string) {
+  let counts: Record<string, number> = {}
+  try {
+    counts = JSON.parse(fsSync.readFileSync(DOCKER_REGISTRY_COUNTS_PATH, 'utf8'))
+  } catch (err: any) {
+    if (err.code !== 'ENOENT') throw err
+  }
+
+  counts[key] = (counts[key] ?? 0) + 1
+  fsSync.writeFileSync(DOCKER_REGISTRY_COUNTS_PATH, JSON.stringify(counts, null, 2))
+}
+
+function sendDockerRegistryObject(
+  res: ServerResponse,
+  {
+    body,
+    contentType,
+    digest,
+  }: {
+    body: Buffer
+    contentType: string
+    digest: string
+  },
+) {
+  res.writeHead(200, {
+    'content-length': body.byteLength,
+    'content-type': contentType,
+    'docker-content-digest': digest,
+    'etag': `"${digest}"`,
+  })
+  res.end(body)
 }
