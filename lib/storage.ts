@@ -17,6 +17,7 @@ import {
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
   S3Client,
 } from '@aws-sdk/client-s3'
@@ -92,12 +93,17 @@ export class Storage {
   }
 
   async uploadPart(uploadId: number, partIndex: number, stream: ReadableStream) {
+    logger.debug('Starting cache upload part', { uploadId, partIndex })
+
     const upload = await this.db
       .selectFrom('uploads')
       .where('id', '=', uploadId)
       .select(['folderName'])
       .executeTakeFirst()
-    if (!upload) return
+    if (!upload) {
+      logger.debug('Ignoring upload part for missing upload', { uploadId, partIndex })
+      return
+    }
 
     await this.db
       .updateTable('uploads')
@@ -120,6 +126,12 @@ export class Storage {
       })
       .where('id', '=', uploadId)
       .execute()
+
+    logger.debug('Finished cache upload part', {
+      folderName: upload.folderName,
+      partIndex,
+      uploadId,
+    })
   }
 
   async completeUpload({
@@ -133,6 +145,8 @@ export class Storage {
     scope: string
     repoId: string
   }) {
+    logger.debug('Finalizing cache upload', { key, repoId, scope, version })
+
     const upload = await this.db
       .selectFrom('uploads')
       .where('key', '=', key)
@@ -141,14 +155,33 @@ export class Storage {
       .where('repoId', '=', repoId)
       .selectAll()
       .executeTakeFirst()
-    if (!upload) return
+    if (!upload) {
+      logger.debug('Cache upload finalize missed upload row', { key, repoId, scope, version })
+      return
+    }
 
     if (upload.finishedPartUploadCount === 0) {
+      logger.debug('Rejecting cache upload with no uploaded parts', {
+        key,
+        repoId,
+        scope,
+        uploadId: upload.id,
+        version,
+      })
       await this.db.deleteFrom('uploads').where('id', '=', upload.id).execute()
       throw new Error('No parts have been uploaded')
     }
 
     if (upload.startedPartUploadCount !== upload.finishedPartUploadCount) {
+      logger.debug('Rejecting incomplete cache upload', {
+        finishedPartUploadCount: upload.finishedPartUploadCount,
+        key,
+        repoId,
+        scope,
+        startedPartUploadCount: upload.startedPartUploadCount,
+        uploadId: upload.id,
+        version,
+      })
       await this.db.deleteFrom('uploads').where('id', '=', upload.id).execute()
       throw new Error(
         `Not all parts have been uploaded (only ${upload.finishedPartUploadCount} of ${upload.startedPartUploadCount} parts uploaded)`,
@@ -157,6 +190,16 @@ export class Storage {
 
     const partCount = await this.adapter.countFilesInFolder(`${upload.folderName}/parts`)
     if (partCount !== upload.finishedPartUploadCount) {
+      logger.debug('Rejecting cache upload with missing stored parts', {
+        actualPartCount: partCount,
+        expectedPartCount: upload.finishedPartUploadCount,
+        folderName: upload.folderName,
+        key,
+        repoId,
+        scope,
+        uploadId: upload.id,
+        version,
+      })
       await this.db.deleteFrom('uploads').where('id', '=', upload.id).execute()
       throw new Error(
         `Uploaded part count does not match actual part count in storage (expected ${upload.finishedPartUploadCount} but found ${partCount})`,
@@ -248,22 +291,43 @@ export class Storage {
       await tx.deleteFrom('uploads').where('id', '=', upload.id).execute()
     })
 
+    logger.debug('Finalized cache upload', {
+      folderName: upload.folderName,
+      key,
+      partCount,
+      repoId,
+      scope,
+      uploadId: upload.id,
+      version,
+    })
+
     return upload
   }
 
   async download(cacheEntryId: string): Promise<Readable | undefined> {
+    logger.debug('Resolving cache download', { cacheEntryId })
+
     const storageLocation = await this.db
       .selectFrom('storage_locations')
       .innerJoin('cache_entries', 'cache_entries.locationId', 'storage_locations.id')
       .where('cache_entries.id', '=', cacheEntryId)
       .selectAll('storage_locations')
       .executeTakeFirst()
-    if (!storageLocation) return
+    if (!storageLocation) {
+      logger.debug('Cache download metadata not found', { cacheEntryId })
+      return
+    }
 
     const availableLocation = storageLocation.availableAt
       ? storageLocation
       : await this.waitForStorageLocationAvailability(storageLocation.id)
-    if (!availableLocation) return
+    if (!availableLocation) {
+      logger.debug('Cache download storage location is unavailable', {
+        cacheEntryId,
+        locationId: storageLocation.id,
+      })
+      return
+    }
 
     void this.db
       .updateTable('storage_locations')
@@ -274,6 +338,15 @@ export class Storage {
       .execute()
 
     try {
+      logger.debug('Opening cache download stream', {
+        cacheEntryId,
+        folderName: availableLocation.folderName,
+        locationId: availableLocation.id,
+        merged: !!availableLocation.mergedAt,
+        mergeStarted: !!availableLocation.mergeStartedAt,
+        partCount: availableLocation.partCount,
+      })
+
       if (availableLocation.mergedAt || availableLocation.mergeStartedAt)
         return await this.downloadFromCacheEntryLocation(availableLocation)
 
@@ -418,6 +491,8 @@ export class Storage {
     scope: string
     repoId: string
   }) {
+    logger.debug('Creating cache upload', { key, repoId, scope, version })
+
     const existingUpload = await this.db
       .selectFrom('uploads')
       .where('key', '=', key)
@@ -426,7 +501,16 @@ export class Storage {
       .where('repoId', '=', repoId)
       .select('id')
       .executeTakeFirst()
-    if (existingUpload) return
+    if (existingUpload) {
+      logger.debug('Cache upload already exists', {
+        key,
+        repoId,
+        scope,
+        uploadId: existingUpload.id,
+        version,
+      })
+      return
+    }
 
     const uploadId = generateNumberId()
     const folderName = uploadId.toString()
@@ -455,7 +539,16 @@ export class Storage {
         .where('repoId', '=', repoId)
         .select('id')
         .executeTakeFirst()
-      if (existingCacheEntry) return
+      if (existingCacheEntry) {
+        logger.debug('Cache entry already exists while creating upload', {
+          cacheEntryId: existingCacheEntry.id,
+          key,
+          repoId,
+          scope,
+          version,
+        })
+        return
+      }
 
       const locationId = randomUUID()
       await tx
@@ -485,6 +578,8 @@ export class Storage {
         .execute()
     })
 
+    logger.debug('Created cache upload', { folderName, key, repoId, scope, uploadId, version })
+
     return { id: uploadId }
   }
 
@@ -502,11 +597,13 @@ export class Storage {
     for (const scope of scopes) {
       const exactPrimaryMatch = await this.db
         .selectFrom('cache_entries')
+        .innerJoin('storage_locations', 'storage_locations.id', 'cache_entries.locationId')
         .where('key', '=', primaryKey)
         .where('version', '=', version)
         .where('scope', '=', scope)
         .where('repoId', '=', repoId)
-        .selectAll()
+        .where('storage_locations.availableAt', 'is not', null)
+        .selectAll('cache_entries')
         .executeTakeFirst()
       if (exactPrimaryMatch)
         return {
@@ -516,14 +613,16 @@ export class Storage {
 
       const prefixedPrimaryMatch = await this.db
         .selectFrom('cache_entries')
+        .innerJoin('storage_locations', 'storage_locations.id', 'cache_entries.locationId')
         .where(
-          sql<boolean>`${sql.ref('key')} like ${`${escapeLikePattern(primaryKey)}%`} escape ${'\\'}`,
+          sql<boolean>`${sql.ref('cache_entries.key')} like ${`${escapeLikePattern(primaryKey)}%`} escape ${'\\'}`,
         )
         .where('version', '=', version)
         .where('scope', '=', scope)
         .where('repoId', '=', repoId)
+        .where('storage_locations.availableAt', 'is not', null)
         .orderBy('cache_entries.updatedAt', 'desc')
-        .selectAll()
+        .selectAll('cache_entries')
         .executeTakeFirst()
 
       if (prefixedPrimaryMatch)
@@ -537,12 +636,14 @@ export class Storage {
       for (const key of restoreKeys) {
         const exactMatch = await this.db
           .selectFrom('cache_entries')
+          .innerJoin('storage_locations', 'storage_locations.id', 'cache_entries.locationId')
           .where('key', '=', key)
           .where('version', '=', version)
           .where('scope', '=', scope)
           .where('repoId', '=', repoId)
-          .orderBy('updatedAt', 'desc')
-          .selectAll()
+          .where('storage_locations.availableAt', 'is not', null)
+          .orderBy('cache_entries.updatedAt', 'desc')
+          .selectAll('cache_entries')
           .executeTakeFirst()
         if (exactMatch)
           return {
@@ -552,14 +653,16 @@ export class Storage {
 
         const prefixedMatch = await this.db
           .selectFrom('cache_entries')
+          .innerJoin('storage_locations', 'storage_locations.id', 'cache_entries.locationId')
           .where(
-            sql<boolean>`${sql.ref('key')} like ${`${escapeLikePattern(key)}%`} escape ${'\\'}`,
+            sql<boolean>`${sql.ref('cache_entries.key')} like ${`${escapeLikePattern(key)}%`} escape ${'\\'}`,
           )
           .where('version', '=', version)
           .where('scope', '=', scope)
           .where('repoId', '=', repoId)
-          .orderBy('updatedAt', 'desc')
-          .selectAll()
+          .where('storage_locations.availableAt', 'is not', null)
+          .orderBy('cache_entries.updatedAt', 'desc')
+          .selectAll('cache_entries')
           .executeTakeFirst()
 
         if (prefixedMatch)
@@ -572,33 +675,115 @@ export class Storage {
   }
 
   async getCacheEntryWithDownloadUrl(args: Parameters<typeof this.matchCacheEntry>[0]) {
-    const cacheEntry = await this.matchCacheEntry(args)
-    if (!cacheEntry) return
-
-    const defaultUrl = `${env.API_BASE_URL}/download/${cacheEntry.match.id}`
-
-    if (!env.ENABLE_DIRECT_DOWNLOADS || !this.adapter.createDownloadUrl)
-      return {
-        downloadUrl: defaultUrl,
-        cacheEntry: cacheEntry.match,
+    while (true) {
+      const cacheEntry = await this.matchCacheEntry(args)
+      if (!cacheEntry) {
+        logger.debug('Cache lookup miss', {
+          keys: args.keys,
+          repoId: args.repoId,
+          scopes: args.scopes,
+          version: args.version,
+        })
+        return
       }
 
-    const location = await this.db
-      .selectFrom('storage_locations')
-      .where('id', '=', cacheEntry.match.locationId)
-      .select(['availableAt', 'folderName', 'mergedAt'])
-      .executeTakeFirst()
-    if (!location) throw new Error('Storage location not found')
+      const location = await this.db
+        .selectFrom('storage_locations')
+        .where('id', '=', cacheEntry.match.locationId)
+        .selectAll()
+        .executeTakeFirst()
+      if (!location) {
+        logger.debug('Cache lookup matched entry without storage location', {
+          cacheEntryId: cacheEntry.match.id,
+          locationId: cacheEntry.match.locationId,
+        })
+        await this.db.deleteFrom('cache_entries').where('id', '=', cacheEntry.match.id).execute()
+        continue
+      }
 
-    const downloadUrl =
-      location.availableAt && location.mergedAt
+      const staleReason = await this.getStaleStorageLocationReason(location)
+      if (staleReason) {
+        await this.deleteStaleStorageLocation(location, staleReason, cacheEntry.match.id)
+        continue
+      }
+
+      const defaultUrl = `${env.API_BASE_URL}/download/${cacheEntry.match.id}`
+
+      if (!env.ENABLE_DIRECT_DOWNLOADS || !this.adapter.createDownloadUrl) {
+        logger.debug('Cache lookup hit', {
+          cacheEntryId: cacheEntry.match.id,
+          key: cacheEntry.match.key,
+          locationId: location.id,
+          type: cacheEntry.type,
+          urlType: 'server',
+        })
+        return {
+          downloadUrl: defaultUrl,
+          cacheEntry: cacheEntry.match,
+        }
+      }
+
+      const downloadUrl = location.mergedAt
         ? await this.adapter.createDownloadUrl(`${location.folderName}/merged`)
         : defaultUrl
 
-    return {
-      downloadUrl,
-      cacheEntry: cacheEntry.match,
+      logger.debug('Cache lookup hit', {
+        cacheEntryId: cacheEntry.match.id,
+        key: cacheEntry.match.key,
+        locationId: location.id,
+        type: cacheEntry.type,
+        urlType: location.mergedAt ? 'direct' : 'server',
+      })
+      return {
+        downloadUrl,
+        cacheEntry: cacheEntry.match,
+      }
     }
+  }
+
+  private async getStaleStorageLocationReason(location: StorageLocation) {
+    if (!location.availableAt) return 'storage location is not finalized'
+
+    if (location.mergedAt) {
+      const mergedObjectName = `${location.folderName}/merged`
+      const exists = await this.objectExists(mergedObjectName)
+      return exists ? undefined : `merged object is missing: ${mergedObjectName}`
+    }
+
+    const partsFolder = `${location.folderName}/parts`
+    const actualPartCount = await this.adapter.countFilesInFolder(partsFolder)
+    if (actualPartCount < location.partCount)
+      return `parts are missing: expected ${location.partCount}, found ${actualPartCount}`
+  }
+
+  private async objectExists(objectName: string) {
+    try {
+      if (this.adapter.objectExists) return await this.adapter.objectExists(objectName)
+
+      const stream = await this.adapter.createDownloadStream(objectName)
+      stream.destroy()
+      return true
+    } catch (err) {
+      if (err instanceof ObjectNotFoundError) return false
+      throw err
+    }
+  }
+
+  private async deleteStaleStorageLocation(
+    location: StorageLocation,
+    reason: string,
+    cacheEntryId: string,
+  ) {
+    logger.warn(`Deleting stale cache entry ${cacheEntryId}: ${reason}`, {
+      cacheEntryId,
+      folderName: location.folderName,
+      locationId: location.id,
+    })
+
+    await this.db.transaction().execute(async (tx) => {
+      await tx.deleteFrom('storage_locations').where('id', '=', location.id).execute()
+      await this.adapter.deleteFolder(location.folderName)
+    })
   }
 }
 
@@ -606,6 +791,7 @@ export const getStorage = createSingletonPromise(async () => Storage.fromEnv())
 
 export interface StorageAdapter {
   createDownloadStream(objectName: string): Promise<Readable>
+  objectExists?(objectName: string): Promise<boolean>
   uploadStream(objectName: string, stream: Readable): Promise<void>
   deleteFolder(folderName: string): Promise<void>
   countFilesInFolder(folderName: string): Promise<number>
@@ -669,6 +855,26 @@ class S3Adapter implements StorageAdapter {
       return response.Body as Readable
     } catch (err: any) {
       if (err.name === 'NoSuchKey') throw new ObjectNotFoundError(objectName)
+      throw err
+    }
+  }
+
+  async objectExists(objectName: string) {
+    try {
+      await this.s3.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: `${this.keyPrefix}/${objectName}`,
+        }),
+      )
+      return true
+    } catch (err: any) {
+      if (
+        err.name === 'NoSuchKey' ||
+        err.name === 'NotFound' ||
+        err.$metadata?.httpStatusCode === 404
+      )
+        return false
       throw err
     }
   }
@@ -785,6 +991,16 @@ class FileSystemAdapter implements StorageAdapter {
     return createReadStream(filePath)
   }
 
+  async objectExists(objectName: string) {
+    try {
+      await fs.access(this.safePath(objectName))
+      return true
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return false
+      throw err
+    }
+  }
+
   async deleteFolder(folderName: string) {
     await fs.rm(this.safePath(folderName), {
       recursive: true,
@@ -873,6 +1089,16 @@ class FilesystemObjectCache {
       return createReadStream(filePath)
     } catch {
       throw new ObjectNotFoundError(objectName)
+    }
+  }
+
+  async objectExists(objectName: string) {
+    try {
+      await fs.access(this.safePath(objectName))
+      return true
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return false
+      throw err
     }
   }
 
@@ -1120,6 +1346,20 @@ export class FilesystemCachingAdapter implements StorageAdapter {
     return stream
   }
 
+  async objectExists(objectName: string) {
+    if (await this.cache.objectExists(objectName)) return true
+    if (this.backend.objectExists) return this.backend.objectExists(objectName)
+
+    try {
+      const stream = await this.backend.createDownloadStream(objectName)
+      stream.destroy()
+      return true
+    } catch (err) {
+      if (err instanceof ObjectNotFoundError) return false
+      throw err
+    }
+  }
+
   async uploadStream(objectName: string, stream: Readable) {
     const { filePath, size } = await this.cache.putForWriteback(objectName, stream)
     const writeback = this.backend
@@ -1190,6 +1430,11 @@ class GcsAdapter implements StorageAdapter {
     const [exists] = await file.exists()
     if (!exists) throw new ObjectNotFoundError(objectName)
     return file.createReadStream()
+  }
+
+  async objectExists(objectName: string) {
+    const [exists] = await this.bucket.file(`${this.keyPrefix}/${objectName}`).exists()
+    return exists
   }
 
   async deleteFolder(folderName: string) {

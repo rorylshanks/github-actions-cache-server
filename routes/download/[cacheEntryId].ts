@@ -1,5 +1,6 @@
 import { Readable } from 'node:stream'
 import { z } from 'zod'
+import { logger } from '~/lib/logger'
 import { getStorage } from '~/lib/storage'
 
 const pathParamsSchema = z.object({
@@ -15,14 +16,17 @@ export default defineEventHandler(async (event) => {
     })
 
   const { cacheEntryId } = parsedPathParams.data
+  logger.debug('Download route requested cache entry', { cacheEntryId })
 
   const storage = await getStorage()
   const stream = await storage.download(cacheEntryId)
-  if (!stream)
+  if (!stream) {
+    logger.debug('Download route cache file not found', { cacheEntryId })
     throw createError({
       statusCode: 404,
       message: 'Cache file not found',
     })
+  }
 
   return sendStream(event, Readable.toWeb(stream) as ReadableStream)
 })
