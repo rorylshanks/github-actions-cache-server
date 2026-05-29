@@ -59,6 +59,26 @@ export const DOCKER_REGISTRY_MANIFEST_BODY = jsonBuffer({
   schemaVersion: 2,
 })
 export const DOCKER_REGISTRY_MANIFEST_DIGEST = digest(DOCKER_REGISTRY_MANIFEST_BODY)
+export const DOCKER_REGISTRY_UPDATED_MANIFEST_BODY = jsonBuffer({
+  annotations: {
+    'org.opencontainers.image.revision': 'updated',
+  },
+  config: {
+    digest: DOCKER_REGISTRY_CONFIG_DIGEST,
+    mediaType: DOCKER_REGISTRY_CONFIG_MEDIA_TYPE,
+    size: DOCKER_REGISTRY_CONFIG_BODY.byteLength,
+  },
+  layers: [
+    {
+      digest: DOCKER_REGISTRY_LAYER_DIGEST,
+      mediaType: DOCKER_REGISTRY_LAYER_MEDIA_TYPE,
+      size: DOCKER_REGISTRY_LAYER_BODY.byteLength,
+    },
+  ],
+  mediaType: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+  schemaVersion: 2,
+})
+export const DOCKER_REGISTRY_UPDATED_MANIFEST_DIGEST = digest(DOCKER_REGISTRY_UPDATED_MANIFEST_BODY)
 
 export const DOCKER_REGISTRY_COUNTS_PATH = path.join(
   TEST_TEMP_DIR,
@@ -67,6 +87,10 @@ export const DOCKER_REGISTRY_COUNTS_PATH = path.join(
 export const DOCKER_REGISTRY_OFFLINE_PATH = path.join(
   TEST_TEMP_DIR,
   'docker-registry-upstream-offline',
+)
+export const DOCKER_REGISTRY_TAG_CHANGED_PATH = path.join(
+  TEST_TEMP_DIR,
+  'docker-registry-tag-changed',
 )
 
 export function dockerRegistryManifestPath(
@@ -87,6 +111,7 @@ export async function resetDockerRegistryFixtureState() {
   await Promise.all([
     fs.rm(DOCKER_REGISTRY_COUNTS_PATH, { force: true }),
     fs.rm(DOCKER_REGISTRY_OFFLINE_PATH, { force: true }),
+    fs.rm(DOCKER_REGISTRY_TAG_CHANGED_PATH, { force: true }),
   ])
 }
 

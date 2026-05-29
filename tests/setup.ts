@@ -41,6 +41,9 @@ import {
   DOCKER_REGISTRY_REPOSITORY,
   DOCKER_REGISTRY_SLOW_LAYER_BODY,
   DOCKER_REGISTRY_SLOW_LAYER_DIGEST,
+  DOCKER_REGISTRY_TAG_CHANGED_PATH,
+  DOCKER_REGISTRY_UPDATED_MANIFEST_BODY,
+  DOCKER_REGISTRY_UPDATED_MANIFEST_DIGEST,
   dockerRegistryBlobPath,
   dockerRegistryManifestPath,
   resetDockerRegistryFixtureState,
@@ -309,8 +312,19 @@ async function startDockerRegistryFixture() {
       return
     }
 
+    if (url.pathname === dockerRegistryManifestPath('ttl-changed')) {
+      const changed = fsSync.existsSync(DOCKER_REGISTRY_TAG_CHANGED_PATH)
+      sendDockerRegistryObject(res, {
+        body: changed ? DOCKER_REGISTRY_UPDATED_MANIFEST_BODY : DOCKER_REGISTRY_MANIFEST_BODY,
+        contentType: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+        digest: changed ? DOCKER_REGISTRY_UPDATED_MANIFEST_DIGEST : DOCKER_REGISTRY_MANIFEST_DIGEST,
+      })
+      return
+    }
+
     if (
       url.pathname === dockerRegistryManifestPath('latest') ||
+      url.pathname === dockerRegistryManifestPath('ttl-unchanged') ||
       url.pathname ===
         dockerRegistryManifestPath(
           DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,

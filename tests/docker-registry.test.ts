@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import { beforeEach, describe, expect, test } from 'vitest'
+import { getDatabase } from '~/lib/db'
 import {
   DOCKER_REGISTRY_AUTH_CHECK_REFERENCE,
   DOCKER_REGISTRY_AUTH_COUNT_KEY,
@@ -13,6 +14,9 @@ import {
   DOCKER_REGISTRY_REPOSITORY,
   DOCKER_REGISTRY_SLOW_LAYER_BODY,
   DOCKER_REGISTRY_SLOW_LAYER_DIGEST,
+  DOCKER_REGISTRY_TAG_CHANGED_PATH,
+  DOCKER_REGISTRY_UPDATED_MANIFEST_BODY,
+  DOCKER_REGISTRY_UPDATED_MANIFEST_DIGEST,
   dockerRegistryBlobPath,
   dockerRegistryManifestPath,
   readDockerRegistryFixtureCounts,
@@ -27,6 +31,19 @@ async function fetchBuffer(path: string, init?: RequestInit) {
     body: Buffer.from(await response.arrayBuffer()),
     response,
   }
+}
+
+async function expireDockerRegistryManifest(reference: string) {
+  const db = await getDatabase()
+  await db
+    .updateTable('docker_registry_objects')
+    .set({
+      updatedAt: Date.now() - 60 * 60 * 1000,
+    })
+    .where('kind', '=', 'manifest')
+    .where('repository', '=', DOCKER_REGISTRY_REPOSITORY)
+    .where('reference', '=', reference)
+    .execute()
 }
 
 describe('docker registry mirror', () => {
@@ -111,6 +128,62 @@ describe('docker registry mirror', () => {
 
     const counts = await readDockerRegistryFixtureCounts()
     expect(counts[`GET ${blobPath}`]).toBe(1)
+  })
+
+  test('revalidates stale tag manifests without refetching unchanged content', async () => {
+    const reference = 'ttl-unchanged'
+    const manifestPath = dockerRegistryManifestPath(reference)
+    const manifestHeaders = {
+      accept: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+    }
+
+    const firstManifest = await fetchBuffer(manifestPath, {
+      headers: manifestHeaders,
+    })
+    expect(firstManifest.response.status).toBe(200)
+    expect(firstManifest.body.equals(DOCKER_REGISTRY_MANIFEST_BODY)).toBe(true)
+
+    await expireDockerRegistryManifest(reference)
+
+    const cachedManifest = await fetchBuffer(manifestPath, {
+      headers: manifestHeaders,
+    })
+    expect(cachedManifest.response.status).toBe(200)
+    expect(cachedManifest.body.equals(DOCKER_REGISTRY_MANIFEST_BODY)).toBe(true)
+
+    const counts = await readDockerRegistryFixtureCounts()
+    expect(counts[`GET ${manifestPath}`]).toBe(1)
+    expect(counts[`HEAD ${manifestPath}`]).toBe(1)
+  })
+
+  test('invalidates stale tag manifests when the upstream digest changes', async () => {
+    const reference = 'ttl-changed'
+    const manifestPath = dockerRegistryManifestPath(reference)
+    const manifestHeaders = {
+      accept: DOCKER_REGISTRY_MANIFEST_MEDIA_TYPE,
+    }
+
+    const firstManifest = await fetchBuffer(manifestPath, {
+      headers: manifestHeaders,
+    })
+    expect(firstManifest.response.status).toBe(200)
+    expect(firstManifest.body.equals(DOCKER_REGISTRY_MANIFEST_BODY)).toBe(true)
+
+    await expireDockerRegistryManifest(reference)
+    await fs.writeFile(DOCKER_REGISTRY_TAG_CHANGED_PATH, '1')
+
+    const updatedManifest = await fetchBuffer(manifestPath, {
+      headers: manifestHeaders,
+    })
+    expect(updatedManifest.response.status).toBe(200)
+    expect(updatedManifest.response.headers.get('docker-content-digest')).toBe(
+      DOCKER_REGISTRY_UPDATED_MANIFEST_DIGEST,
+    )
+    expect(updatedManifest.body.equals(DOCKER_REGISTRY_UPDATED_MANIFEST_BODY)).toBe(true)
+
+    const counts = await readDockerRegistryFixtureCounts()
+    expect(counts[`HEAD ${manifestPath}`]).toBe(1)
+    expect(counts[`GET ${manifestPath}`]).toBe(2)
   })
 
   test('proxies tag list requests to Docker Hub-compatible upstream', async () => {

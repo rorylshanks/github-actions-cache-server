@@ -96,6 +96,16 @@ export class DockerRegistryMirror {
         now - existing.updatedAt < env.DOCKERHUB_MANIFEST_TTL_SECONDS * 1000)
 
     if (isFresh) return this.serveStoredObject(event, existing)
+    if (existing?.status === 'ready' && !isDigestReference(reference)) {
+      const revalidated = await this.revalidateManifestTag({
+        accept,
+        object: existing,
+        reference,
+        repository: normalizedRepository,
+      })
+      if (revalidated) return this.serveStoredObject(event, revalidated)
+    }
+
     if (existing?.status === 'filling') {
       const object = await this.waitForObject(objectKey)
       if (object) return this.serveStoredObject(event, object)
@@ -355,6 +365,30 @@ export class DockerRegistryMirror {
     return object
   }
 
+  private async markObjectChecked(object: DockerRegistryObject, upstream?: Response) {
+    const contentLength = upstream ? headerNumber(upstream.headers, 'content-length') : null
+    const contentType = upstream?.headers.get('content-type')
+    const digest = upstream?.headers.get('docker-content-digest')
+    const etag = upstream?.headers.get('etag')
+
+    await this.db
+      .updateTable('docker_registry_objects')
+      .set({
+        ...(contentLength === null ? {} : { contentLength }),
+        ...(contentType ? { contentType } : {}),
+        ...(digest ? { digest } : {}),
+        ...(etag ? { etag } : {}),
+        updatedAt: Date.now(),
+      })
+      .where('id', '=', object.id)
+      .execute()
+
+    const updated = await this.getObject(object.objectKey)
+    if (!updated)
+      throw new Error(`Docker registry object disappeared after revalidation: ${object.objectKey}`)
+    return updated
+  }
+
   private async markObjectError(objectKey: string) {
     await this.db
       .updateTable('docker_registry_objects')
@@ -364,6 +398,49 @@ export class DockerRegistryMirror {
       })
       .where('id', '=', objectId(objectKey))
       .execute()
+  }
+
+  private async revalidateManifestTag({
+    accept,
+    object,
+    reference,
+    repository,
+  }: {
+    accept: string
+    object: DockerRegistryObject
+    reference: string
+    repository: string
+  }) {
+    let upstream: Response
+    try {
+      upstream = await this.fetchUpstream(repository, `manifests/${reference}`, {
+        headers: {
+          accept,
+        },
+        method: 'HEAD',
+      })
+    } catch (err) {
+      logger.warn(`Docker manifest tag revalidation failed for ${repository}:${reference}`, err)
+      return this.markObjectChecked(object)
+    }
+
+    if (!upstream.ok) {
+      logger.warn(
+        `Docker manifest tag revalidation failed for ${repository}:${reference}: ${upstream.status} ${upstream.statusText}`,
+      )
+      return this.markObjectChecked(object)
+    }
+
+    const upstreamDigest = upstream.headers.get('docker-content-digest')
+    const upstreamEtag = upstream.headers.get('etag')
+    const unchanged =
+      (upstreamDigest && object.digest && upstreamDigest === object.digest) ||
+      (upstreamEtag && object.etag && upstreamEtag === object.etag)
+
+    if (unchanged) return this.markObjectChecked(object, upstream)
+
+    logger.info(`Docker manifest tag changed for ${repository}:${reference}; invalidating cache`)
+    await this.markObjectError(object.objectKey)
   }
 
   private async serveStoredObject(event: any, object: DockerRegistryObject) {
